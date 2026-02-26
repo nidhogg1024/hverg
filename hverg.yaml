@@ -1,0 +1,24 @@
+server:
+  addr: ":8080"
+
+routes:
+  # Route 1: Pure HTTP proxy with JWT authentication
+  - path: /api/v1/users
+    method: GET
+    backend: http://localhost:8081
+    plugins:
+      - name: jwt_auth
+        config:
+          header_name: Authorization
+          secret: "my-secret-key"
+
+  # Route 2: gRPC transcoder plugin mock
+  - path: /api/v2/orders
+    method: POST
+    backend: grpc://localhost:9090
+    plugins:
+      - name: grpc_transcoder
+        config:
+          proto_service: order.v1.OrderService
+          proto_method: CreateOrder
+          descriptor_file: testdata/pb/order.desc

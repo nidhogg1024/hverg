@@ -1,0 +1,20 @@
+syntax = "proto3";
+
+package order.v1;
+
+option go_package = "github.com/nidhogg1024/hverg/testdata/pb;order_v1";
+
+service OrderService {
+  rpc CreateOrder(CreateOrderRequest) returns (CreateOrderResponse) {}
+}
+
+message CreateOrderRequest {
+  string user_id = 1;
+  string item_id = 2;
+  int32 quantity = 3;
+}
+
+message CreateOrderResponse {
+  string order_id = 1;
+  string status = 2;
+}
