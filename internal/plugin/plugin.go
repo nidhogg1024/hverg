@@ -6,24 +6,54 @@ import (
 	"github.com/nidhogg1024/hverg/internal/config"
 )
 
-// Context provides contextual information for a plugin during execution.
-// It wraps standard HTTP request and response writer.
+// Context 是每个请求流经插件链时的上下文对象。
+// 它封装了标准的 HTTP 请求/响应，并提供跨插件的 Key-Value 存储。
 type Context struct {
 	Writer  http.ResponseWriter
 	Request *http.Request
 
-	// Aborted indicates if the current request should stop propagating through the plugin chain.
-	// This is typically set to true by auth or rate limiting plugins when they fail.
+	// Aborted 表示当前请求是否应停止在插件链中继续传播
 	Aborted bool
+
+	// keys 存储跨插件传递的数据，例如鉴权插件解析出的 UserID 可以被后续插件读取。
+	// 延迟初始化，只在第一次 Set 时分配内存。
+	keys map[string]interface{}
 }
 
-// Abort stops the plugin chain and optionally writes a status code.
+// Set 在上下文中存储一个 Key-Value 对，供后续插件读取。
+func (c *Context) Set(key string, value interface{}) {
+	if c.keys == nil {
+		c.keys = make(map[string]interface{})
+	}
+	c.keys[key] = value
+}
+
+// Get 从上下文中获取指定 key 的值。
+func (c *Context) Get(key string) (interface{}, bool) {
+	if c.keys == nil {
+		return nil, false
+	}
+	val, ok := c.keys[key]
+	return val, ok
+}
+
+// GetString 从上下文中获取指定 key 的字符串值，不存在或类型不匹配时返回空字符串。
+func (c *Context) GetString(key string) string {
+	val, ok := c.Get(key)
+	if !ok {
+		return ""
+	}
+	s, _ := val.(string)
+	return s
+}
+
+// Abort 中止插件链并写入 HTTP 状态码。
 func (c *Context) Abort(code int) {
 	c.Aborted = true
 	c.Writer.WriteHeader(code)
 }
 
-// AbortWithStatusJSON aborts and writes JSON response
+// AbortWithStatusJSON 中止插件链并写入 JSON 响应。
 func (c *Context) AbortWithStatusJSON(code int, jsonBytes []byte) {
 	c.Aborted = true
 	c.Writer.Header().Set("Content-Type", "application/json")

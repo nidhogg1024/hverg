@@ -54,14 +54,18 @@ func (p *JWTAuthPlugin) Handle(ctx *plugin.Context) error {
 		token = strings.TrimPrefix(token, "Bearer ")
 	}
 
-	// TODO: Replace with actual JWT validation logic using a library like golang-jwt/jwt
+	// TODO: 替换为真实的 JWT 签名验证逻辑（如 golang-jwt/jwt）
 	if p.Secret != "" && token != "valid-mock-token" {
 		slog.Warn("Invalid token", "token", token)
 		ctx.AbortWithStatusJSON(401, []byte(`{"error": "unauthorized", "message": "invalid token"}`))
 		return nil
 	}
 
-	// Inject parsed user info into request context/headers for upstream
+	// 将解析出的用户信息写入 Context，后续插件可通过 ctx.GetString("user_id") 获取
+	ctx.Set("user_id", "mock-user-id")
+	ctx.Set("authenticated", true)
+
+	// 同时写入 HTTP Header，以便下游 HTTP 后端也能获取到鉴权信息
 	ctx.Request.Header.Set("X-User-Id", "mock-user-id")
 
 	return nil

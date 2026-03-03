@@ -1,51 +1,188 @@
 # Hverg (Hvergelmir Gateway)
 
-## 项目背景 (Background)
+一个轻量级、插件化的 API 网关，支持 HTTP 反向代理透传与基于动态 Protobuf 描述符的 HTTP-to-gRPC 泛化调用。
 
-Hverg (Hvergelmir Gateway) 是一个定位为**业务 API 网关 (Edge Gateway)** 的开源项目。
-
-**项目命名的神话渊源**：
-Nidhogg（尼德霍格）在北欧神话中是盘踞在世界之树底部的黑龙。而 Hvergelmir（赫瓦格密尔）正是世界之树第一根树根下的**“沸腾之泉”**（所有河流的源头），也是 Nidhogg 栖息的地方。
-作为微服务架构的流量入口，Hverg 隐喻了“一切请求的起点”与“流量的源头”，与作者的个人 ID 形成了完美的生态闭环。
+> **Hvergelmir**（赫瓦格密尔）是北欧神话中世界之树根下的"沸腾之泉"，所有河流的源头，也是黑龙 Nidhogg 栖息之地。
+> Hverg 隐喻了"一切请求的起点"——微服务架构的流量之源。
 
 ---
 
-## 核心架构讨论记录 (Architecture Discussions)
+## 核心特性
 
-### 1. 明确剥离 BFF 职责，回归纯粹网关
-*   **痛点与边界**：如果网关承担了 BFF（Backend For Frontend）的数据聚合和 UI 专属逻辑，会导致网关需要随着前端需求极其频繁地发版，这与网关需要极高稳定性的要求背道而驰。
-*   **Hverg 的清晰定位**：**Hverg 不做 BFF，不做业务数据的组装与裁剪**。它专注于：
-    1.  **统一接入与路由**：根据 URL Path 路由到对应的后端 gRPC 服务。
-    2.  **统一鉴权 (AuthN/AuthZ)**：解析 Token、校验权限、将上下文（如 UserID）透传给下游。
-    3.  **协议转换**：丝滑、高效地完成外网 HTTP/JSON 到内网 gRPC/Protobuf 的转换。
-*   **架构收益**：网关本身不包含业务拼装逻辑，发版频率大幅降低，真正成为坚如磐石的流量入口。复杂的聚合逻辑交由下游专门的 BFF 服务处理。
-
-### 2. HTTP 转 gRPC 的必要性与性能
-*   **为什么内网要 gRPC？**
-    *   **性能优越**：Protobuf 二进制压缩 + HTTP/2 多路复用。
-    *   **强契约**：`.proto` 文件天生作为跨语言调用的接口契约。
-*   **为什么外网要 HTTP？**
-    *   前端（Web/App）直接对接 gRPC 生态仍有摩擦（如 gRPC-Web 调试困难），RESTful + JSON 依然是前端最舒适的体验。
-*   **转换的性能瓶颈在哪？**
-    *   瓶颈**不在网络 I/O**，而在**序列化/反序列化（JSON <-> PB）及反射的 CPU 开销**。这是我们在后续技术选型中需要重点攻克的问题。
-
-### 3. Protobuf (PB) 的“版本地狱”管理
-*   **传统方案痛点**：“每个服务独立 PB 仓库 -> CI 生成代码 -> 互相引用拉取” 容易导致菱形依赖冲突，且开发链路过长、心智负担重。
-*   **Hverg 建议借鉴的现代化方案**：
-    *   **Mono-repo 管理**：全公司/全项目维护一个统一的 `api-pb` 仓库，按服务和版本划分目录结构。
-    *   **引入 Buf**：放弃传统的 `protoc`。使用 Buf 实现直接依赖 `.proto` 模块、自动化 Lint、破坏性变更（Breaking Change）检测。
+- **极简 HTTP 反向代理**：零配置将 HTTP/JSON 请求透传到下游 HTTP 后端，开箱即用。
+- **动态 gRPC 转译 (Transcoder)**：通过加载 `.desc` Protobuf 描述符文件，在运行时将 HTTP/JSON 请求动态翻译为 gRPC 调用——无需生成任何 Stub 代码，无需重新编译网关。
+- **插件化架构 (Plugin Pipeline)**：鉴权、限流、协议转换等所有功能均以插件形式按路由挂载，按需组合。
+- **声明式 YAML 配置**：一份配置文件定义全部路由与插件链，清晰易读。
+- **优雅停机 (Graceful Shutdown)**：支持信号驱动的平滑关闭，保证在途请求处理完毕。
 
 ---
 
-## 下一步设计方向探讨 (Next Steps)
+## 架构总览
 
-由于明确了**剥离 BFF 职责**，Hverg 作为一个纯粹的协议转换与路由网关，其核心路由与转换机制的选择变得尤为重要：
+```
+                        ┌─────────────────────────────────────────┐
+                        │            Hverg Gateway                │
+  Client ──HTTP/JSON──► │  Router ──► Plugin Chain ──► Backend    │
+                        │             (Auth, Transcoder, ...)     │
+                        └──────────────┬──────────────┬───────────┘
+                                       │              │
+                              HTTP Proxy (透传)   gRPC Invoke (泛化调用)
+                                       │              │
+                                       ▼              ▼
+                              ┌──────────────┐ ┌──────────────┐
+                              │ HTTP Service │ │ gRPC Service │
+                              └──────────────┘ └──────────────┘
+```
 
-*   **A 方案（静态编译派）**：类似 `grpc-gateway`，在**编译期**生成硬编码的 HTTP->gRPC 转换与路由逻辑。
-    *   *优势*：性能无敌，类型安全。
-    *   *劣势*：虽然网关没有业务逻辑，但下游每次新增或修改接口，网关**仍需重新编译发版**才能生效，依然存在部署耦合。
-*   **B 方案（动态解析派 - 泛化调用）**：网关是一个独立运行的代理，在**运行期**加载全量的 PB 描述符（Descriptor Set），通过配置文件定义路由映射，利用反射或动态 PB 解析器直接完成 JSON 到 gRPC 的转换调用。
-    *   *优势*：极其灵活。下游加接口，网关**完全不需要重启**，推个配置（甚至通过控制面动态下发）就通了，真正实现网关与业务迭代的解耦。
-    *   *劣势*：反射损耗会导致单机 QPS 上限受限，需要探索高效的动态解析方案（如缓存 Descriptor、优化 JSON 序列化路径）。
+---
 
-*(当前探讨焦点：在明确纯网关定位后，A、B 方案的技术选型与可行性分析...)*
+## 快速开始
+
+### 前置要求
+
+- Go 1.22+
+- [Buf CLI](https://buf.build/docs/installation)（仅在需要生成 `.desc` 文件时使用）
+
+### 1. 构建
+
+```bash
+git clone https://github.com/nidhogg1024/hverg.git
+cd hverg
+go build -o bin/hverg cmd/hverg/main.go
+```
+
+### 2. 配置
+
+创建或编辑 `hverg.yaml`：
+
+```yaml
+server:
+  addr: ":8080"
+
+routes:
+  # 场景一：纯 HTTP 透传
+  - path: /api/v1/users
+    method: GET
+    backend: http://localhost:8081
+    plugins:
+      - name: jwt_auth
+        config:
+          header_name: Authorization
+          secret: "my-secret-key"
+
+  # 场景二：HTTP -> gRPC 动态转译
+  - path: /api/v2/orders
+    method: POST
+    backend: grpc://localhost:9090
+    plugins:
+      - name: grpc_transcoder
+        config:
+          proto_service: order.v1.OrderService
+          proto_method: CreateOrder
+          descriptor_file: testdata/pb/order.desc
+```
+
+### 3. 启动
+
+```bash
+./bin/hverg -config hverg.yaml
+```
+
+---
+
+## gRPC 动态转译说明
+
+Hverg 的核心卖点之一：**无需编译任何 Stub 代码，即可将 HTTP/JSON 请求转换为 gRPC 调用**。
+
+### 工作原理
+
+1. 使用 `buf build` 或 `protoc --descriptor_set_out` 将 `.proto` 文件编译为二进制描述符文件 (`.desc`)。
+2. 网关启动时加载 `.desc` 文件，构建内存中的 Protobuf 类型注册表。
+3. 收到 HTTP 请求后，利用 `dynamicpb` + `protojson` 将 JSON Body 动态反序列化为 Protobuf Message。
+4. 通过 `grpc.Invoke` 发起泛化调用，再将响应序列化回 JSON 返回给客户端。
+
+### 生成描述符文件
+
+```bash
+# 使用 Buf（推荐）
+buf build testdata/pb -o testdata/pb/order.desc
+
+# 或使用 protoc
+protoc --descriptor_set_out=order.desc --include_imports testdata/pb/order.proto
+```
+
+### 测试
+
+```bash
+# HTTP 透传测试（需要后端在 8081 端口运行一个 HTTP 服务）
+curl http://localhost:8080/api/v1/users \
+  -H "Authorization: Bearer valid-mock-token"
+
+# gRPC 转译测试（需要后端在 9090 端口运行一个 gRPC 服务）
+curl -X POST http://localhost:8080/api/v2/orders \
+  -H "Content-Type: application/json" \
+  -d '{"user_id": "u123", "item_id": "item456", "quantity": 2}'
+```
+
+---
+
+## 项目结构
+
+```
+hverg/
+├── cmd/hverg/                  # 网关入口
+│   └── main.go
+├── internal/
+│   ├── config/                 # YAML 配置加载与定义
+│   │   ├── config.go
+│   │   └── loader.go
+│   ├── plugin/                 # 插件引擎与接口定义
+│   │   ├── plugin.go           # Plugin 接口、Chain、Registry
+│   │   ├── auth/               # JWT 鉴权插件
+│   │   │   └── jwt.go
+│   │   └── transcoder/         # gRPC 动态转译插件
+│   │       └── transcoder.go
+│   ├── proxy/                  # HTTP 反向代理封装
+│   │   └── proxy.go
+│   └── router/                 # 路由引擎
+│       └── router.go
+├── testdata/pb/                # 测试用 Protobuf 文件
+│   └── order.proto
+├── hverg.yaml                  # 示例配置文件
+├── go.mod
+└── go.sum
+```
+
+---
+
+## 内置插件
+
+| 插件名 | 说明 | 关键配置项 |
+|--------|------|-----------|
+| `jwt_auth` | JWT / Bearer Token 鉴权 | `header_name`, `secret` |
+| `grpc_transcoder` | HTTP/JSON -> gRPC 动态转译 | `proto_service`, `proto_method`, `descriptor_file` |
+
+---
+
+## 设计哲学
+
+- **不做 BFF**：Hverg 不做业务数据的聚合与裁剪，只做统一接入、鉴权和协议转换。复杂的组装逻辑交给下游的 BFF 服务。
+- **网关越薄越稳**：核心基座只是一个极简的反向代理，所有增值功能通过插件挂载，保证基座的极高稳定性。
+- **动态优于静态**：通过运行时加载 Protobuf 描述符实现泛化调用，下游新增接口无需重新编译网关，推送配置即可生效。
+
+---
+
+## Roadmap
+
+- [ ] 真实 JWT 签名验证（集成 `golang-jwt/jwt`）
+- [ ] gRPC 连接池与负载均衡
+- [ ] 配置热重载（文件监听 / etcd / Consul）
+- [ ] 更多内置插件：限流、熔断、请求日志、跨域 (CORS)
+- [ ] 管理 API / 控制面
+- [ ] 完整的集成测试套件
+
+---
+
+## License
+
+MIT

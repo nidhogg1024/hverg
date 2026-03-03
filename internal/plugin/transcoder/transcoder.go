@@ -4,16 +4,11 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"os"
 	"strings"
 
 	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/protobuf/encoding/protojson"
-	"google.golang.org/protobuf/proto"
-	"google.golang.org/protobuf/reflect/protodesc"
 	"google.golang.org/protobuf/reflect/protoreflect"
-	"google.golang.org/protobuf/types/descriptorpb"
 	"google.golang.org/protobuf/types/dynamicpb"
 
 	"github.com/nidhogg1024/hverg/internal/plugin"
@@ -23,154 +18,116 @@ func init() {
 	plugin.Register("grpc_transcoder", NewTranscoderPlugin)
 }
 
-// TranscoderPlugin intercepts HTTP requests and translates them to gRPC calls
-// using dynamic protobuf descriptors.
+// TranscoderPlugin 拦截 HTTP 请求，通过动态 Protobuf 描述符将其转换为 gRPC 泛化调用。
 type TranscoderPlugin struct {
-	ProtoService   string
-	ProtoMethod    string
-	DescriptorFile string
-	Backend        string
+	protoService string
+	protoMethod  string
 
 	methodDesc protoreflect.MethodDescriptor
 	conn       *grpc.ClientConn
 	resolver   *dynamicpb.Types
+
+	// 预分配的 protojson 选项，避免每次请求重新构造
+	unmarshalOpts protojson.UnmarshalOptions
+	marshalOpts   protojson.MarshalOptions
 }
 
-// NewTranscoderPlugin creates a new transcoder plugin instance.
+// NewTranscoderPlugin 通过配置创建 Transcoder 插件实例。
+// 使用全局的连接池和描述符缓存，避免重复创建。
 func NewTranscoderPlugin(cfg map[string]interface{}) (plugin.Plugin, error) {
-	t := &TranscoderPlugin{}
+	protoService, _ := cfg["proto_service"].(string)
+	protoMethod, _ := cfg["proto_method"].(string)
+	descriptorFile, _ := cfg["descriptor_file"].(string)
+	backend, _ := cfg["_route_backend"].(string)
 
-	if ps, ok := cfg["proto_service"].(string); ok {
-		t.ProtoService = ps
+	if descriptorFile == "" {
+		return nil, fmt.Errorf("grpc_transcoder: descriptor_file is required")
 	}
-	if pm, ok := cfg["proto_method"].(string); ok {
-		t.ProtoMethod = pm
-	}
-	if df, ok := cfg["descriptor_file"].(string); ok {
-		t.DescriptorFile = df
-	}
-	if be, ok := cfg["_route_backend"].(string); ok {
-		t.Backend = be
+	if protoService == "" || protoMethod == "" {
+		return nil, fmt.Errorf("grpc_transcoder: proto_service and proto_method are required")
 	}
 
-	if t.DescriptorFile == "" {
-		return nil, fmt.Errorf("descriptor_file is required for grpc_transcoder")
-	}
-
-	// 1. Load the descriptor set from file
-	b, err := os.ReadFile(t.DescriptorFile)
+	// 从全局缓存加载描述符（如果已经加载过则直接命中）
+	entry, err := globalDescCache.GetOrLoad(descriptorFile)
 	if err != nil {
-		return nil, fmt.Errorf("failed to read descriptor file %s: %w", t.DescriptorFile, err)
+		return nil, err
 	}
 
-	var fds descriptorpb.FileDescriptorSet
-	if err := proto.Unmarshal(b, &fds); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal descriptor set: %w", err)
-	}
-
-	// 2. Build a registry from the descriptor set
-	files, err := protodesc.NewFiles(&fds)
+	// 在描述符注册表中查找目标 gRPC 方法
+	methodDesc, err := entry.FindMethod(protoService, protoMethod)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create registry from descriptor set: %w", err)
+		return nil, fmt.Errorf("grpc_transcoder: %w", err)
 	}
-	t.resolver = dynamicpb.NewTypes(files)
 
-	// 3. Find the method descriptor
-	// Service name needs to be fully qualified, e.g., "order.v1.OrderService"
-	serviceName := protoreflect.FullName(t.ProtoService)
-	desc, err := files.FindDescriptorByName(serviceName)
+	// 从全局连接池获取/创建到后端的 gRPC 连接
+	target := strings.TrimPrefix(backend, "grpc://")
+	conn, err := globalConnPool.GetConn(target)
 	if err != nil {
-		return nil, fmt.Errorf("failed to find service %s: %w", t.ProtoService, err)
+		return nil, err
 	}
 
-	serviceDesc, ok := desc.(protoreflect.ServiceDescriptor)
-	if !ok {
-		return nil, fmt.Errorf("%s is not a service", t.ProtoService)
-	}
-
-	methodDesc := serviceDesc.Methods().ByName(protoreflect.Name(t.ProtoMethod))
-	if methodDesc == nil {
-		return nil, fmt.Errorf("method %s not found in service %s", t.ProtoMethod, t.ProtoService)
-	}
-	t.methodDesc = methodDesc
-
-	// 4. Establish gRPC connection to backend
-	// Remove "grpc://" prefix if present
-	target := strings.TrimPrefix(t.Backend, "grpc://")
-	conn, err := grpc.NewClient(target, grpc.WithTransportCredentials(insecure.NewCredentials()))
-	if err != nil {
-		return nil, fmt.Errorf("failed to connect to grpc backend %s: %w", target, err)
-	}
-	t.conn = conn
-
-	return t, nil
+	return &TranscoderPlugin{
+		protoService: protoService,
+		protoMethod:  protoMethod,
+		methodDesc:   methodDesc,
+		conn:         conn,
+		resolver:     entry.types,
+		unmarshalOpts: protojson.UnmarshalOptions{
+			DiscardUnknown: true,
+			Resolver:       entry.types,
+		},
+		marshalOpts: protojson.MarshalOptions{
+			EmitUnpopulated: true,
+			Resolver:        entry.types,
+		},
+	}, nil
 }
 
-// Name returns the plugin name.
 func (p *TranscoderPlugin) Name() string {
 	return "grpc_transcoder"
 }
 
-// Handle executes the dynamic gRPC translation logic.
+// Handle 执行动态 gRPC 转译逻辑：
+// JSON Body -> dynamicpb.Message -> gRPC Invoke -> dynamicpb.Message -> JSON Response
 func (p *TranscoderPlugin) Handle(ctx *plugin.Context) error {
-	slog.Info("Executing gRPC transcoder plugin",
-		"service", p.ProtoService,
-		"method", p.ProtoMethod,
-		"path", ctx.Request.URL.Path,
-	)
-
-	// 1. Read JSON body from HTTP request
+	// 1. 读取 HTTP 请求的 JSON Body
 	body, err := io.ReadAll(ctx.Request.Body)
 	if err != nil {
-		ctx.AbortWithStatusJSON(400, []byte(`{"error": "failed to read request body"}`))
+		ctx.AbortWithStatusJSON(400, []byte(`{"error":"failed to read request body"}`))
 		return nil
 	}
 	defer ctx.Request.Body.Close()
 
-	// 2. Create dynamic request message and unmarshal JSON
-	reqMsg := dynamicpb.NewMessage(p.methodDesc.Input())
-	
-	// If body is empty, treat it as empty JSON object
 	if len(body) == 0 {
 		body = []byte("{}")
 	}
 
-	unmarshaler := protojson.UnmarshalOptions{
-		DiscardUnknown: true,
-		Resolver:       p.resolver,
-	}
-	if err := unmarshaler.Unmarshal(body, reqMsg); err != nil {
-		slog.Error("Failed to unmarshal JSON to protobuf", "err", err)
-		ctx.AbortWithStatusJSON(400, []byte(fmt.Sprintf(`{"error": "invalid json format: %v"}`, err)))
+	// 2. 利用描述符将 JSON 反序列化为动态 Protobuf Message
+	reqMsg := dynamicpb.NewMessage(p.methodDesc.Input())
+	if err := p.unmarshalOpts.Unmarshal(body, reqMsg); err != nil {
+		slog.Error("JSON -> Protobuf unmarshal failed", "err", err, "service", p.protoService, "method", p.protoMethod)
+		ctx.AbortWithStatusJSON(400, []byte(fmt.Sprintf(`{"error":"invalid json: %v"}`, err)))
 		return nil
 	}
 
-	// 3. Invoke gRPC method dynamically
+	// 3. 发起 gRPC 泛化调用
 	respMsg := dynamicpb.NewMessage(p.methodDesc.Output())
-	invokePath := fmt.Sprintf("/%s/%s", p.ProtoService, p.ProtoMethod)
+	fullMethod := fmt.Sprintf("/%s/%s", p.protoService, p.protoMethod)
 
-	// Pass context from HTTP request
-	err = p.conn.Invoke(ctx.Request.Context(), invokePath, reqMsg, respMsg)
-	if err != nil {
-		slog.Error("gRPC invocation failed", "path", invokePath, "err", err)
-		ctx.AbortWithStatusJSON(500, []byte(fmt.Sprintf(`{"error": "upstream grpc error: %v"}`, err)))
+	if err := p.conn.Invoke(ctx.Request.Context(), fullMethod, reqMsg, respMsg); err != nil {
+		slog.Error("gRPC invoke failed", "method", fullMethod, "err", err)
+		ctx.AbortWithStatusJSON(502, []byte(fmt.Sprintf(`{"error":"upstream grpc error: %v"}`, err)))
 		return nil
 	}
 
-	// 4. Serialize dynamic response message back to JSON
-	marshaler := protojson.MarshalOptions{
-		EmitUnpopulated: true,
-		Resolver:        p.resolver,
-	}
-	respJSON, err := marshaler.Marshal(respMsg)
+	// 4. 将响应 Protobuf Message 序列化为 JSON 返回给客户端
+	respJSON, err := p.marshalOpts.Marshal(respMsg)
 	if err != nil {
-		slog.Error("Failed to marshal protobuf to JSON", "err", err)
-		ctx.AbortWithStatusJSON(500, []byte(`{"error": "failed to encode response"}`))
+		slog.Error("Protobuf -> JSON marshal failed", "err", err)
+		ctx.AbortWithStatusJSON(500, []byte(`{"error":"failed to encode response"}`))
 		return nil
 	}
 
-	// 5. Write JSON response to client
 	ctx.AbortWithStatusJSON(200, respJSON)
-
 	return nil
 }
